@@ -326,3 +326,78 @@ async fn legacy_unowned_handoffs_stay_visible_to_everyone() {
         );
     }
 }
+
+#[tokio::test]
+async fn request_keys_partition_publishers_even_for_shared_handoffs() {
+    let h = harness(Some("operator"), true).await;
+    let args = json!({"workspace":"default", "project":"scratch",
+        "summary":"shared transition", "shared":true, "request_key":"same-key"});
+    let alice = proxied("x-memory-actor-user", "alice");
+    let bob = proxied("x-memory-actor-user", "bob");
+    let first = call(&h.http, "memory_handoff_begin", args.clone(), &alice).await;
+    let second = call(&h.http, "memory_handoff_begin", args.clone(), &bob).await;
+    let replay = call(&h.http, "memory_handoff_begin", args, &alice).await;
+    assert_ne!(first["handoff_id"], second["handoff_id"]);
+    assert_eq!(first["handoff_id"], replay["handoff_id"]);
+    assert_eq!(replay["replayed"], true);
+}
+
+#[tokio::test]
+async fn request_key_replay_works_with_regular_database_credentials() {
+    use ai_memory_core::{ApiCredentialId, NewUser, UserRole};
+    use ai_memory_store::{TokenPepper, generate_api_key, hash_token};
+    let h = harness(None, false).await;
+    let pepper = TokenPepper::new("handoff-retry-test-pepper-only");
+    let token = generate_api_key().unwrap();
+    let id = h
+        .store
+        .writer
+        .create_human_user(
+            NewUser {
+                username: "retry-user".into(),
+                name: None,
+                email: None,
+            },
+            UserRole::User,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    h.store
+        .writer
+        .create_api_credential(
+            ApiCredentialId::new(),
+            id,
+            "retry-test".into(),
+            hash_token(&token, &pepper),
+            None,
+        )
+        .await
+        .unwrap();
+    let auth = AuthState::new(Some(ROOT_TOKEN.into())).with_multiuser(
+        pepper,
+        h.store.reader.clone(),
+        h.store.writer.clone(),
+    );
+    let http = h.local.layer(axum::middleware::from_fn_with_state(
+        Arc::new(auth),
+        require_bearer,
+    ));
+    let bearer = format!("Bearer {token}");
+    let headers = [("authorization", bearer.as_str())];
+    let args = json!({"workspace":"default", "project":"scratch",
+        "summary":"regular-user retry", "request_key":"request-1"});
+    let first = call(&http, "memory_handoff_begin", args.clone(), &headers).await;
+    call(
+        &http,
+        "memory_handoff_accept",
+        json!({"workspace":"default", "project":"scratch"}),
+        &headers,
+    )
+    .await;
+    let retry = call(&http, "memory_handoff_begin", args, &headers).await;
+    assert_eq!(first["handoff_id"], retry["handoff_id"]);
+    assert_eq!(retry["state"], "accepted");
+    assert_eq!(retry["replayed"], true);
+}

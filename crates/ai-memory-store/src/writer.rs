@@ -27,9 +27,9 @@ use crate::auto_improve::{
 };
 use crate::error::{StoreError, StoreResult};
 use crate::ops::{
-    self, AdmittedSession, DeleteWorkspaceSummary, EmbeddingWrite, HookSessionAdmission,
-    IngestObservationOutcome, LifecycleOnlyEndOutcome, MoveSessionSummary, MoveSummary,
-    ObservationPruneOutcome, PagesMode, PurgeSummary, ReorgSummary,
+    self, AdmittedSession, DeleteWorkspaceSummary, EmbeddingWrite, HandoffPublishResult,
+    HookSessionAdmission, IngestObservationOutcome, LifecycleOnlyEndOutcome, MoveSessionSummary,
+    MoveSummary, ObservationPruneOutcome, PagesMode, PurgeSummary, ReorgSummary,
 };
 use crate::session_consolidation::SessionConsolidationJob;
 use crate::users::{self, TOKEN_HASH_LEN};
@@ -218,6 +218,12 @@ pub(crate) enum WriteCmd {
     InsertHandoff {
         handoff: NewHandoff,
         reply: oneshot::Sender<StoreResult<HandoffId>>,
+    },
+    InsertHandoffOnce {
+        handoff: NewHandoff,
+        publisher: Option<String>,
+        request_key: String,
+        reply: oneshot::Sender<StoreResult<HandoffPublishResult>>,
     },
     AcceptHandoff {
         acceptance: HandoffAcceptance,
@@ -1182,6 +1188,36 @@ impl WriterHandle {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::InsertHandoff { handoff, reply: tx })
             .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Insert a handoff once for a publisher-scoped request key.
+    ///
+    /// The request key is accepted only when it is 1..=128 ASCII alphanumeric
+    /// characters or one of `-_.:`. A replay returns the bound handoff's
+    /// current state and does not append another handoff or audit event. The
+    /// publisher is a qualified [`IdentityKey::storage_key`] value when the
+    /// caller is authenticated; `None` uses the anonymous publisher bucket.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::InvalidState`] for an invalid key, publisher,
+    /// payload conflict, or missing/moved bound handoff; returns
+    /// [`StoreError::WriterClosed`] when the actor has shut down, or propagates
+    /// SQL errors.
+    pub async fn insert_handoff_once(
+        &self,
+        handoff: NewHandoff,
+        publisher: Option<String>,
+        request_key: String,
+    ) -> StoreResult<HandoffPublishResult> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::InsertHandoffOnce {
+            handoff,
+            publisher,
+            request_key,
+            reply: tx,
+        })
+        .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
@@ -2846,6 +2882,20 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             WriteCmd::InsertHandoff { handoff, reply } => {
                 let result = ops::insert_handoff(&mut conn, &handoff);
                 send_or_warn(reply, result, "insert_handoff");
+            }
+            WriteCmd::InsertHandoffOnce {
+                handoff,
+                publisher,
+                request_key,
+                reply,
+            } => {
+                let result = ops::insert_handoff_once(
+                    &mut conn,
+                    &handoff,
+                    publisher.as_deref(),
+                    &request_key,
+                );
+                send_or_warn(reply, result, "insert_handoff_once");
             }
             WriteCmd::AcceptHandoff { acceptance, reply } => {
                 let result = ops::accept_handoff(&mut conn, &acceptance);

@@ -431,3 +431,26 @@ async fn unauthorised_any_owner_cancel_reaches_no_webhook() {
         "the refused cancel must not have discarded the baton",
     );
 }
+
+#[tokio::test]
+async fn request_key_replay_checks_admission_without_duplicate_observers() {
+    let (addr, calls) = recording_webhook_host().await;
+    let h = harness(guarded_chain(addr)).await;
+    let args = json!({"workspace":"default", "project":"scratch",
+        "summary":"retry publication", "request_key":"observer-retry"});
+    let first = call_tool(&h.router, "memory_handoff_begin", args.clone()).await;
+    wait_for(&calls, ("mirror", "handoff_begin")).await;
+    wait_for(&calls, ("observer", "handoff_begin")).await;
+    let replay = call_tool(&h.router, "memory_handoff_begin", args).await;
+    assert_eq!(first["handoff_id"], replay["handoff_id"]);
+    assert_eq!(replay["replayed"], true);
+    settle().await;
+    let seen = calls.lock().unwrap().clone();
+    for (name, expected) in [("guard", 2), ("mirror", 1), ("observer", 1)] {
+        assert_eq!(
+            seen.iter().filter(|(hook, _)| hook == name).count(),
+            expected,
+            "unexpected webhook calls: {seen:?}"
+        );
+    }
+}

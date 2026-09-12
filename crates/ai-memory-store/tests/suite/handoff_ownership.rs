@@ -14,10 +14,11 @@
 //! string that could drift from it.
 
 use ai_memory_core::{
-    ActorContext, AgentKind, HandoffAcceptance, HandoffId, IdentityKey, NewHandoff, OwnerFilter,
-    ProjectId, WorkspaceId, owner_stamp,
+    ActorContext, AgentKind, HandoffAcceptance, HandoffId, HandoffState, IdentityKey, NewHandoff,
+    OwnerFilter, ProjectId, WorkspaceId, owner_stamp,
 };
-use ai_memory_store::Store;
+use ai_memory_store::{Store, StoreError};
+use rusqlite::Connection;
 
 /// The qualified storage key a username-identified operator owns rows under.
 fn operator(name: &str) -> String {
@@ -133,6 +134,339 @@ async fn one_operators_handoff_is_not_delivered_to_another() {
         .expect("Alice keeps her own handoff");
     assert_eq!(alice.content.summary, "resume the OAuth refactor");
     assert_eq!(alice.origin.owner_user, Some(operator("alice")));
+}
+
+/// A retry of one publish request converges on the first handoff row.
+#[tokio::test]
+async fn keyed_handoff_retry_reuses_original_id() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let handoff = handoff(ws, proj, "retry me", Some("alice"));
+
+    let first = store
+        .writer
+        .insert_handoff_once(
+            handoff.clone(),
+            Some(operator("alice")),
+            "session-end:retry-1".into(),
+        )
+        .await
+        .unwrap();
+    let retry = store
+        .writer
+        .insert_handoff_once(
+            handoff,
+            Some(operator("alice")),
+            "session-end:retry-1".into(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(first.state, ai_memory_core::HandoffState::Open);
+    assert!(!first.replayed);
+    assert_eq!(
+        retry.id, first.id,
+        "a request retry must not create a second row"
+    );
+    assert_eq!(retry.state, first.state);
+    assert!(retry.replayed);
+}
+
+#[tokio::test]
+async fn keyed_handoff_same_key_concurrency_creates_one_row() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let handoff = handoff(ws, proj, "one concurrent publish", None);
+    let mut calls = Vec::new();
+    for _ in 0..16 {
+        let writer = store.writer.clone();
+        let handoff = handoff.clone();
+        calls.push(tokio::spawn(async move {
+            writer
+                .insert_handoff_once(handoff, None, "concurrent-key".into())
+                .await
+        }));
+    }
+
+    let mut results = Vec::new();
+    for call in calls {
+        results.push(call.await.unwrap().unwrap());
+    }
+    let first = results[0];
+    assert_eq!(first.state, HandoffState::Open);
+    assert_eq!(results.iter().filter(|result| !result.replayed).count(), 1);
+    assert!(results.iter().all(|result| result.id == first.id));
+    assert_eq!(
+        store
+            .reader
+            .list_handoffs(ws, proj, None, OwnerFilter::Any, 100)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn keyed_handoff_distinct_keys_create_distinct_rows_and_conflicts_fail() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let original = handoff(ws, proj, "original payload", None);
+    let first = store
+        .writer
+        .insert_handoff_once(original.clone(), None, "key-a".into())
+        .await
+        .unwrap();
+    let second = store
+        .writer
+        .insert_handoff_once(original.clone(), None, "key-b".into())
+        .await
+        .unwrap();
+    assert_ne!(first.id, second.id);
+    assert!(!first.replayed);
+    assert!(!second.replayed);
+
+    let conflict = store
+        .writer
+        .insert_handoff_once(
+            handoff(ws, proj, "changed payload", None),
+            None,
+            "key-a".into(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(conflict, StoreError::InvalidState(message) if message.contains("different payload"))
+    );
+    assert_eq!(
+        store
+            .reader
+            .list_handoffs(ws, proj, None, OwnerFilter::Any, 100)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn keyed_handoff_retry_returns_accepted_and_expired_state() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let accepted_handoff = handoff(ws, proj, "accepted", Some("alice"));
+    let accepted = store
+        .writer
+        .insert_handoff_once(
+            accepted_handoff.clone(),
+            Some(operator("alice")),
+            "accepted-key".into(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .writer
+            .accept_handoff(acceptance(
+                accepted.id,
+                ws,
+                proj,
+                Some(operator("alice")),
+                filter_for("alice"),
+                None,
+            ))
+            .await
+            .unwrap()
+    );
+    let accepted_retry = store
+        .writer
+        .insert_handoff_once(
+            accepted_handoff,
+            Some(operator("alice")),
+            "accepted-key".into(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(accepted_retry.id, accepted.id);
+    assert_eq!(accepted_retry.state, HandoffState::Accepted);
+    assert!(accepted_retry.replayed);
+
+    let expired_handoff = handoff(ws, proj, "expired", Some("alice"));
+    let expired = store
+        .writer
+        .insert_handoff_once(
+            expired_handoff.clone(),
+            Some(operator("alice")),
+            "expired-key".into(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .writer
+            .expire_open_handoffs(ws, proj, filter_for("alice"), None, None)
+            .await
+            .unwrap(),
+        1
+    );
+    let expired_retry = store
+        .writer
+        .insert_handoff_once(
+            expired_handoff,
+            Some(operator("alice")),
+            "expired-key".into(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(expired_retry.id, expired.id);
+    assert_eq!(expired_retry.state, HandoffState::Expired);
+    assert!(expired_retry.replayed);
+}
+
+#[tokio::test]
+async fn keyed_handoff_publisher_and_scope_are_independent_namespaces() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let shared = handoff(ws, proj, "shared payload", None);
+    let alice = store
+        .writer
+        .insert_handoff_once(shared.clone(), Some(operator("alice")), "same-key".into())
+        .await
+        .unwrap();
+    let bob = store
+        .writer
+        .insert_handoff_once(shared, Some(operator("bob")), "same-key".into())
+        .await
+        .unwrap();
+    assert_ne!(alice.id, bob.id);
+
+    let other_project = store
+        .writer
+        .get_or_create_project(ws, "other-app".to_string(), None)
+        .await
+        .unwrap();
+    let other_scope = handoff(ws, other_project, "shared payload", None);
+    let other = store
+        .writer
+        .insert_handoff_once(other_scope, Some(operator("alice")), "same-key".into())
+        .await
+        .unwrap();
+    assert_ne!(alice.id, other.id);
+}
+
+#[tokio::test]
+async fn keyed_handoff_deleted_row_keeps_tombstone_and_rejects_retry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let handoff = handoff(ws, proj, "deleted", None);
+    let created = store
+        .writer
+        .insert_handoff_once(handoff.clone(), None, "deleted-key".into())
+        .await
+        .unwrap();
+
+    let conn = Connection::open(tmp.path().join("db/memory.sqlite")).unwrap();
+    conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+    conn.execute(
+        "DELETE FROM handoffs WHERE id = ?1",
+        rusqlite::params![created.id.as_bytes()],
+    )
+    .unwrap();
+    drop(conn);
+
+    let retry = store
+        .writer
+        .insert_handoff_once(handoff, None, "deleted-key".into())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(retry, StoreError::InvalidState(message) if message.contains("missing handoff"))
+    );
+    let binding: Option<Vec<u8>> = Connection::open(tmp.path().join("db/memory.sqlite"))
+        .unwrap()
+        .query_row(
+            "SELECT handoff_id FROM handoff_request_keys WHERE workspace_id = ?1 AND project_id = ?2 AND publisher = '' AND request_key = 'deleted-key'",
+            rusqlite::params![ws.as_bytes(), proj.as_bytes()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        binding.is_none(),
+        "deleted handoff binding must be a tombstone"
+    );
+}
+
+#[tokio::test]
+async fn keyed_handoff_moved_row_rejects_original_scope_retry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (source_ws, proj) = scope(&store).await;
+    let destination_ws = store
+        .writer
+        .get_or_create_workspace("acme-destination".to_string())
+        .await
+        .unwrap();
+    let handoff = handoff(source_ws, proj, "moved", None);
+    store
+        .writer
+        .insert_handoff_once(handoff.clone(), None, "moved-key".into())
+        .await
+        .unwrap();
+    store
+        .writer
+        .move_project_workspace(proj, source_ws, destination_ws)
+        .await
+        .unwrap();
+
+    let retry = store
+        .writer
+        .insert_handoff_once(handoff, None, "moved-key".into())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(retry, StoreError::InvalidState(message) if message.contains("moved handoff"))
+    );
+}
+
+#[tokio::test]
+async fn keyed_handoff_validates_request_key_and_publisher() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    for key in ["", "bad key", "é", &"x".repeat(129)] {
+        let error = store
+            .writer
+            .insert_handoff_once(handoff(ws, proj, "invalid key", None), None, key.into())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, StoreError::InvalidState(message) if message.contains("request key")),
+            "unexpected error for key {key:?}: {error:?}"
+        );
+    }
+    let error = store
+        .writer
+        .insert_handoff_once(
+            handoff(ws, proj, "invalid publisher", None),
+            Some("alice".into()),
+            "valid-key".into(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, StoreError::InvalidState(message) if message.contains("publisher")));
+    assert!(
+        store
+            .reader
+            .list_handoffs(ws, proj, None, OwnerFilter::Any, 100)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 /// The SQL query must exclude foreign rows before it deserializes any of their

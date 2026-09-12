@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Added optional request keys to explicit MCP handoff publication so retries
+  reuse the original handoff after acceptance or expiration, reject changed
+  payloads, and preserve separate intended publications. (#1)
+
 ## [2.2.0] - 2026-09-12
 
 ### Added

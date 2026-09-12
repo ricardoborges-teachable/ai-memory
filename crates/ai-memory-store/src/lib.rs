@@ -51,10 +51,10 @@ pub use error::{StoreError, StoreResult};
 pub use maintenance::MaintenanceJob;
 pub use ops::{
     AdmittedSession, BootstrapChunkRecord, CompactSummary, Compaction, DeleteWorkspaceSummary,
-    EmbedOutcome, EmbeddingWrite, EntityBackfillSummary, HookSessionAdmission,
-    IngestObservationOutcome, LifecycleOnlyEndOutcome, MoveSessionSummary, MoveSummary,
-    ObservationPruneOutcome, OkfMigratedPage, PagesMode, PurgeSessionSummary, PurgeSummary,
-    ReorgSummary, backfill_entity_index, purge_session, record_embed_failure,
+    EmbedOutcome, EmbeddingWrite, EntityBackfillSummary, HandoffPublishResult,
+    HookSessionAdmission, IngestObservationOutcome, LifecycleOnlyEndOutcome, MoveSessionSummary,
+    MoveSummary, ObservationPruneOutcome, OkfMigratedPage, PagesMode, PurgeSessionSummary,
+    PurgeSummary, ReorgSummary, backfill_entity_index, purge_session, record_embed_failure,
 };
 pub use reader::{
     ActivityWindow, AgentSessionCount, AuditEvent, AuditLogFilter, AutoImproveCandidateSession,

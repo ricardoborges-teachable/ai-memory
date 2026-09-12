@@ -531,3 +531,27 @@ supersede-by-new-page instead of editing history. Ask an agent to "record this a
 decision" and the skill does the rest; the structured shape also
 retrieves noticeably better through `memory_query` than free-form
 prose.
+
+### Retrying an explicit handoff publication
+
+For a transport that can lose a `memory_handoff_begin` reply, persist a unique
+`request_key` before sending and reuse it only for retries of that same handoff.
+Keys contain 1–128 ASCII letters, digits, `_`, `-`, `.`, or `:`. Keep the resolved
+workspace/project and publisher identity unchanged across retries.
+
+A keyed publication returns `handoff_id`, `state`, and `replayed`. Replaying the
+same key and normalized stored payload returns the original handoff even when it
+is accepted or expired; it never reopens it. Changing the payload conflicts.
+Within the original resolved scope, a deleted or moved handoff makes the retry
+fail; retain the pending record for reconciliation. Scope identity means the
+resolved database IDs, not just the names supplied by the client. After a scope
+rename or move, retrying an old name can create a new scope and is outside this
+guarantee. Reconcile pending requests before changing scope names or location.
+Project/workspace purge clears that scope’s key history. These guarantees apply to
+keyed explicit MCP publications; unkeyed requests and hook ingestion retain their
+existing behavior. Two intended handoffs need distinct keys even if their text
+is identical. Keys are isolated by publishing identity even for shared handoffs.
+
+`memory_handoff_list` still lists only open handoffs. An empty list cannot prove
+that a lost-response publication failed: another session may have accepted it.
+Retrying the original key resolves that uncertainty without consuming anything.

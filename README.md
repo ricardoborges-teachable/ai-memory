@@ -376,3 +376,8 @@ MIT - see [LICENSE](LICENSE).
 This codebase is being built collaboratively with Claude Code
 (Anthropic Claude Opus 4.7) following the plan documented in
 `docs/design-decisions.md`.
+
+Explicit MCP handoff publishers can use an optional `request_key` to recover
+from lost replies without duplicating an already accepted handoff. See
+[retrying a handoff](docs/usage.md#retrying-an-explicit-handoff-publication) for
+the scope, conflict and retention contract.

@@ -43,3 +43,17 @@ Choose scope from the MCP client's identity support:
 - **Static MCP clients** (including clients with lifecycle hooks but no bridge connecting that hook session id to MCP requests) must pass `workspace` and `project` together on every project-scoped call, including requests about this project, here, or our work. Read the exact names from the nearest `.ai-memory.toml` when it declares both. If it does not, obtain the names from the operator or server configuration; never guess them from a directory name and never rely on the server's last active project.
 
 This rule applies only to project-scoped calls. For cross-project retrieval, `global=true` must omit `workspace`, `project`, and `scopes`. For a standing preference written with `scope: "global"`, omit `workspace` and `project`.
+
+## Uncertain publication replies
+
+Persist an optional `request_key` before calling begin when retries are possible.
+Use 1–128 ASCII letters, digits, `_`, `-`, `.`, or `:`. Reuse it only for the
+same normalized stored payload and resolved scope/publisher. A keyed reply adds
+`state` and `replayed` to `handoff_id`; accepted/expired handoffs stay in that state.
+Different payloads conflict. A deleted/moved handoff cannot be recreated using
+its previous key. Keep unresolved sends pending rather than minting a new key
+to force a retry. Project/workspace purge clears that scope's key history.
+
+Keys are separate from content: two intended handoffs need two different keys.
+Without a key, existing publication behavior remains. An empty open list is not
+proof that publication failed; the original might already have been accepted.

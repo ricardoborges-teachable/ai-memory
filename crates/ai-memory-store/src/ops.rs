@@ -5,11 +5,12 @@
 //! [`crate::writer`]).
 
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 
 use ai_memory_core::{
-    AgentKind, EntityId, HandoffAcceptance, HandoffId, IdentityKey, LinkTarget, NewHandoff,
-    NewObservation, NewPage, NewSession, ObservationId, ObservationKind, OwnerFilter, PageEvidence,
-    PageId, PagePath, ProjectId, SessionId, WorkspaceId,
+    AgentKind, EntityId, HandoffAcceptance, HandoffId, HandoffState, IdentityKey, LinkTarget,
+    NewHandoff, NewObservation, NewPage, NewSession, ObservationId, ObservationKind, OwnerFilter,
+    PageEvidence, PageId, PagePath, ProjectId, SessionId, WorkspaceId,
 };
 
 /// Summary returned by [`reorg_sessions`] and exposed via
@@ -33,6 +34,17 @@ pub enum IngestObservationOutcome {
     ResumePending,
     /// The observation and downstream hook effects already completed.
     AlreadyComplete,
+}
+
+/// Result of publishing a handoff through a request key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HandoffPublishResult {
+    /// Handoff row bound to the request key.
+    pub id: HandoffId,
+    /// Current state of the bound handoff row.
+    pub state: HandoffState,
+    /// Whether this call replayed an existing request-key binding.
+    pub replayed: bool,
 }
 
 /// Unforgeable writer-issued session capability for hook follow-up mutations.
@@ -2516,6 +2528,116 @@ pub fn insert_handoff(conn: &mut Connection, h: &NewHandoff) -> StoreResult<Hand
     Ok(id)
 }
 
+/// Insert a handoff once for an explicit request key.
+///
+/// The binding and handoff row are created in one writer transaction. A
+/// replay returns the bound row's current state without running the ordinary
+/// insert path again (which would otherwise expire same-directory automatic
+/// handoffs or append another audit event). The publisher is independent of
+/// [`NewHandoff::owner_user`]: a shared handoff can still have one private
+/// authenticated publisher's retry namespace.
+pub fn insert_handoff_once(
+    conn: &mut Connection,
+    h: &NewHandoff,
+    publisher: Option<&str>,
+    request_key: &str,
+) -> StoreResult<HandoffPublishResult> {
+    validate_handoff_request_key(request_key)?;
+    validate_identity_storage_key(publisher, "handoff publisher")?;
+
+    // Hash the exact bounded/normalised shape that insert_handoff_row persists,
+    // so semantically equivalent cwd/list values replay the same request.
+    let resolved = resolve_handoff(h)?;
+    let payload_sha256 = handoff_payload_sha256(&resolved)?;
+    // SQLite considers NULL values distinct in UNIQUE constraints. An empty
+    // string is reserved for the anonymous publisher bucket, while real
+    // publishers are qualified `IdentityKey::storage_key()` values.
+    let publisher_bucket = publisher.unwrap_or("");
+    let tx = conn.transaction()?;
+
+    let existing: Option<(Vec<u8>, Option<Vec<u8>>)> = tx
+        .query_row(
+            "SELECT payload_sha256, handoff_id FROM handoff_request_keys \
+             WHERE workspace_id = ?1 AND project_id = ?2 \
+               AND publisher = ?3 AND request_key = ?4",
+            params![
+                h.workspace_id.as_bytes(),
+                h.project_id.as_bytes(),
+                publisher_bucket,
+                request_key,
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+
+    if let Some((stored_payload_sha256, handoff_id_bytes)) = existing {
+        if stored_payload_sha256 != payload_sha256.as_slice() {
+            return Err(StoreError::InvalidState(
+                "handoff request key was already used for a different payload".into(),
+            ));
+        }
+        let Some(handoff_id_bytes) = handoff_id_bytes else {
+            // ON DELETE SET NULL leaves a tombstone. Never recreate a deleted
+            // handoff or expose the old identifier to a retrying caller.
+            return Err(StoreError::InvalidState(
+                "handoff request key refers to a missing handoff".into(),
+            ));
+        };
+        let handoff_metadata: Option<(Vec<u8>, Vec<u8>, String)> = tx
+            .query_row(
+                "SELECT workspace_id, project_id, state FROM handoffs WHERE id = ?1",
+                params![&handoff_id_bytes],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((workspace_id, project_id, state)) = handoff_metadata else {
+            return Err(StoreError::InvalidState(
+                "handoff request key refers to a missing handoff".into(),
+            ));
+        };
+        if workspace_id.as_slice() != h.workspace_id.as_bytes()
+            || project_id.as_slice() != h.project_id.as_bytes()
+        {
+            // A project move restamps the handoff row but intentionally leaves
+            // this original-scope binding in place. Treat that as missing so a
+            // retry cannot reveal or recreate a handoff under a new scope.
+            return Err(StoreError::InvalidState(
+                "handoff request key refers to a moved handoff".into(),
+            ));
+        }
+        let id = HandoffId::from_slice(&handoff_id_bytes)?;
+        let state = state.parse::<HandoffState>().map_err(StoreError::from)?;
+        tx.commit()?;
+        return Ok(HandoffPublishResult {
+            id,
+            state,
+            replayed: true,
+        });
+    }
+
+    let id = insert_handoff_row(&tx, &resolved)?;
+    tx.execute(
+        "INSERT INTO handoff_request_keys \
+         (workspace_id, project_id, publisher, request_key, payload_sha256, handoff_id, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            h.workspace_id.as_bytes(),
+            h.project_id.as_bytes(),
+            publisher_bucket,
+            request_key,
+            payload_sha256.as_slice(),
+            id.as_bytes(),
+            Timestamp::now().as_microsecond(),
+        ],
+    )?;
+    tx.commit()?;
+    Ok(HandoffPublishResult {
+        id,
+        state: HandoffState::Open,
+        replayed: false,
+    })
+}
+
 /// Atomically stamp a session ended and insert its automatic handoff.
 ///
 /// A failed handoff insert rolls the end stamp back, so a keyed retry can run
@@ -2568,6 +2690,44 @@ pub fn end_session_with_handoff(
 const HANDOFF_FIELD_MAX_BYTES: usize = 16 * 1024;
 /// Store-boundary bound on the number of items in a handoff list field.
 const HANDOFF_LIST_MAX_ITEMS: usize = 256;
+
+/// Maximum length of a handoff publish request key.
+const HANDOFF_REQUEST_KEY_MAX_BYTES: usize = 128;
+
+fn validate_handoff_request_key(request_key: &str) -> StoreResult<()> {
+    if request_key.is_empty()
+        || request_key.len() > HANDOFF_REQUEST_KEY_MAX_BYTES
+        || !request_key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+    {
+        return Err(StoreError::InvalidState(
+            "handoff request key must be 1..=128 ASCII alphanumeric characters or -_.:".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve a handoff to the bounded and normalised values persisted by the
+/// store. This is also the payload shape used for request-key hashing.
+fn resolve_handoff(h: &NewHandoff) -> StoreResult<NewHandoff> {
+    validate_identity_storage_key(h.owner_user.as_deref(), "handoff owner")?;
+    let mut resolved = h.clone();
+    resolved.summary = bound_handoff_field(&h.summary);
+    resolved.open_questions = bound_handoff_list(&h.open_questions);
+    resolved.next_steps = bound_handoff_list(&h.next_steps);
+    resolved.files_touched = bound_handoff_list(&h.files_touched);
+    resolved.cwd = h.cwd.as_ref().map(|cwd| {
+        let value = cwd.to_string_lossy();
+        let trimmed = value.trim_end_matches(['/', '\\']);
+        PathBuf::from(if trimmed.is_empty() { "/" } else { trimmed })
+    });
+    Ok(resolved)
+}
+
+fn handoff_payload_sha256(h: &NewHandoff) -> StoreResult<[u8; 32]> {
+    Ok(Sha256::digest(serde_json::to_vec(h)?).into())
+}
 
 fn bound_handoff_field(value: &str) -> String {
     ai_memory_core::truncate_utf8_bytes(value, HANDOFF_FIELD_MAX_BYTES)

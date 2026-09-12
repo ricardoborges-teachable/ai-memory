@@ -237,7 +237,7 @@ developer, user, and canonical project instructions.\n\
   workspace/project. On shared servers the default is your \
   own plus deliberately shared handoffs; `any_owner=true` is root-only \
   recovery and requires an explicit user request.\n\
-- `memory_handoff_begin` — ONLY when the user is wrapping up / ending \
+- `memory_handoff_begin` — Optional `request_key` makes retries reuse the original ID/state; persist it before sending and keep payload/publisher/scope unchanged. ONLY when the user is wrapping up / ending \
   the current session and you want to ensure the next agent has context \
   (the SessionEnd hook also auto-captures this). DO NOT use this to \
   summarize work mid-session, check project status, or answer a request \
@@ -979,6 +979,12 @@ struct AutoImproveArgs {
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 struct HandoffBeginArgs {
+    /// Stable key for retries of one publication (1–128 ASCII letters, digits,
+    /// `_`, `-`, `.`, or `:`). Reuse only with the same payload, publisher and
+    /// scope. Keyed replies include state and replayed; accepted/expired rows
+    /// are never reopened. Omit for independent unkeyed publications.
+    #[serde(default)]
+    request_key: Option<String>,
     /// Short prose summary of where the session left off.
     summary: String,
     /// Questions the next agent should resolve.
@@ -3505,6 +3511,18 @@ impl AiMemoryServer {
         Parameters(args): Parameters<HandoffBeginArgs>,
         OptionalParts(parts): OptionalParts,
     ) -> Result<CallToolResult, McpError> {
+        if let Some(key) = args.request_key.as_deref()
+            && (key.is_empty()
+                || key.len() > 128
+                || !key
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"_-.:".contains(&b)))
+        {
+            return Err(McpError::invalid_params(
+                "invalid handoff request_key",
+                None,
+            ));
+        }
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         // Handoffs bypass `Wiki::write_page` (they live in their own
         // table), so scrub the agent-supplied free-text here. We don't
@@ -3581,6 +3599,31 @@ impl AiMemoryServer {
         let admission = self
             .authorize_operation(ws, proj, ai_memory_wiki::AdmissionOp::HandoffBegin, &parts)
             .await?;
+        if let Some(key) = args.request_key {
+            // Publisher identity is independent of delivery ownership: shared
+            // handoffs must not collapse two operators' request namespaces.
+            let publisher = creator
+                .identity_key()
+                .map(|identity| identity.storage_key());
+            let result = self
+                .writer
+                .insert_handoff_once(handoff, publisher, key)
+                .await
+                .map_err(|e| match e {
+                    ai_memory_store::StoreError::InvalidState(message) => {
+                        McpError::invalid_params(message, None)
+                    }
+                    other => McpError::internal_error(other.to_string(), None),
+                })?;
+            if !result.replayed {
+                self.notify_operation_observers(admission.as_ref());
+            }
+            return ok_json(&serde_json::json!({
+                "handoff_id": result.id.to_string(),
+                "state": result.state,
+                "replayed": result.replayed,
+            }));
+        }
         let id = self
             .writer
             .insert_handoff(handoff)
@@ -10239,6 +10282,7 @@ mod tests {
         server
             .memory_handoff_begin(
                 Parameters(HandoffBeginArgs {
+                    request_key: None,
                     summary: "fix omp CHECK".into(),
                     open_questions: vec![],
                     next_steps: vec![],
@@ -10278,11 +10322,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handoff_request_key_invalid_before_scope_creation() {
+        let (_tmp, store, server, ws, _pj) = setup_server().await;
+        for key in [
+            "".to_string(),
+            "bad key".into(),
+            "é".into(),
+            "x".repeat(129),
+        ] {
+            let result = server.memory_handoff_begin(
+                Parameters(serde_json::from_value(serde_json::json!({
+                    "summary":"not created", "workspace":"default", "project":"never-created", "request_key":key
+                })).unwrap()), OptionalParts(test_parts_default())
+            ).await;
+            assert!(result.is_err());
+        }
+        assert!(
+            store
+                .reader
+                .find_project(ws, "never-created".into())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn handoff_request_key_rejects_changed_payload() {
+        let (_tmp, _store, server, _ws, _pj) = setup_server().await;
+        let original = serde_json::json!({"summary":"original", "request_key":"conflict-1"});
+        server
+            .memory_handoff_begin(
+                Parameters(serde_json::from_value(original.clone()).unwrap()),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let mut changed = original;
+        changed["summary"] = serde_json::json!("different");
+        assert!(
+            server
+                .memory_handoff_begin(
+                    Parameters(serde_json::from_value(changed).unwrap()),
+                    OptionalParts(test_parts_default())
+                )
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn handoff_request_key_replays_after_acceptance() {
+        let (_tmp, _store, server, _ws, _pj) = setup_server().await;
+        let payload = serde_json::json!({
+            "summary": "one intended handoff", "request_key": "lost-reply-1"
+        });
+        let first = server
+            .memory_handoff_begin(
+                Parameters(serde_json::from_value(payload.clone()).unwrap()),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let first: serde_json::Value =
+            serde_json::from_str(&first.content[0].as_text().unwrap().text).unwrap();
+        server
+            .memory_handoff_accept(
+                Parameters(serde_json::from_value(serde_json::json!({})).unwrap()),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let retry = server
+            .memory_handoff_begin(
+                Parameters(serde_json::from_value(payload).unwrap()),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let retry: serde_json::Value =
+            serde_json::from_str(&retry.content[0].as_text().unwrap().text).unwrap();
+        assert_eq!(
+            first["handoff_id"], retry["handoff_id"],
+            "retry must reuse the accepted original"
+        );
+        assert_eq!(retry["state"], "accepted");
+        assert_eq!(retry["replayed"], true);
+    }
+
+    #[tokio::test]
     async fn handoff_begin_then_accept_round_trips() {
         let (_tmp, _store, server, _ws, _pj) = setup_server().await;
         let begin = server
             .memory_handoff_begin(
                 Parameters(HandoffBeginArgs {
+                    request_key: None,
                     summary: "left mid-refactor of writer actor".into(),
                     open_questions: vec!["what max channel size?".into()],
                     next_steps: vec!["finish supersession path".into()],
@@ -10360,6 +10494,7 @@ mod tests {
         server
             .memory_handoff_begin(
                 Parameters(HandoffBeginArgs {
+                    request_key: None,
                     summary: "wire-shape probe".into(),
                     open_questions: vec![],
                     next_steps: vec![],
@@ -10437,6 +10572,7 @@ mod tests {
         server
             .memory_handoff_begin(
                 Parameters(HandoffBeginArgs {
+                    request_key: None,
                     summary: "s".repeat(HANDOFF_SUMMARY_MAX_CHARS + 20),
                     open_questions: vec!["q".repeat(HANDOFF_ITEM_MAX_CHARS + 20)],
                     next_steps: vec!["n".repeat(HANDOFF_ITEM_MAX_CHARS + 20)],
@@ -10484,6 +10620,7 @@ mod tests {
         server
             .memory_handoff_begin(
                 Parameters(HandoffBeginArgs {
+                    request_key: None,
                     summary: "contains sk-testsecret12345678901234567890 before cap".into(),
                     open_questions,
                     next_steps: vec![],
@@ -10546,6 +10683,7 @@ mod tests {
         server
             .memory_handoff_begin(
                 Parameters(HandoffBeginArgs {
+                    request_key: None,
                     summary: "cross-workspace handoff".into(),
                     open_questions: vec![],
                     next_steps: vec![],
@@ -10627,6 +10765,7 @@ mod tests {
         let begin = server
             .memory_handoff_begin(
                 Parameters(HandoffBeginArgs {
+                    request_key: None,
                     summary: "inspect-without-claim baton".into(),
                     open_questions: vec!["still open?".into()],
                     next_steps: vec!["claim by id".into()],
@@ -10735,6 +10874,7 @@ mod tests {
         let first = server
             .memory_handoff_begin(
                 Parameters(HandoffBeginArgs {
+                    request_key: None,
                     summary: "first pending baton".into(),
                     open_questions: vec![],
                     next_steps: vec![],
@@ -10751,6 +10891,7 @@ mod tests {
         let second = server
             .memory_handoff_begin(
                 Parameters(HandoffBeginArgs {
+                    request_key: None,
                     summary: "sibling pending baton".into(),
                     open_questions: vec![],
                     next_steps: vec![],
@@ -10964,6 +11105,7 @@ mod tests {
         let begin = server
             .memory_handoff_begin(
                 Parameters(HandoffBeginArgs {
+                    request_key: None,
                     summary: "accidental status summary".into(),
                     open_questions: vec![],
                     next_steps: vec![],
