@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Included handoff, workspace, and project IDs in automatic SessionStart
+  handoff headers so receivers can reconcile the delivered identity without
+  claiming the handoff again. (#2)
+
 ### Added
 - Added optional request keys to explicit MCP handoff publication so retries
   reuse the original handoff after acceptance or expiration, reject changed

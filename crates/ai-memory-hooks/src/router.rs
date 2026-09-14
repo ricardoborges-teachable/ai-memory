@@ -1793,6 +1793,10 @@ fn render_handoff_markdown(h: &Handoff) -> String {
         from = h.origin.from_agent.as_str(),
         ts = h.lifecycle.created_at,
     ));
+    buf.push_str(&format!(
+        "> **Handoff ID:** `{}`\n> **Workspace ID:** `{}`\n> **Project ID:** `{}`\n",
+        h.scope.id, h.scope.workspace_id, h.scope.project_id,
+    ));
     buf.push_str("> **Security boundary:** ");
     buf.push_str(ai_memory_core::UNTRUSTED_MEMORY_NOTICE);
     buf.push_str("\n\n");
@@ -3840,6 +3844,18 @@ mod tests {
             },
         };
         let rendered = render_handoff_markdown(&handoff);
+        for (label, id) in [
+            ("Handoff ID", handoff.scope.id.to_string()),
+            ("Workspace ID", handoff.scope.workspace_id.to_string()),
+            ("Project ID", handoff.scope.project_id.to_string()),
+        ] {
+            let metadata = format!("> **{label}:** `{id}`\n");
+            assert!(rendered.contains(&metadata), "missing {label}");
+            assert!(
+                rendered.find(&metadata).unwrap() < rendered.find(UNTRUSTED_HISTORY_START).unwrap(),
+                "typed identity must be in the header"
+            );
+        }
         let warning = rendered
             .find(ai_memory_core::UNTRUSTED_MEMORY_NOTICE)
             .expect("handoff must include the trust boundary");

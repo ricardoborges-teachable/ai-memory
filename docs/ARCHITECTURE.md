@@ -380,6 +380,12 @@ invariants below.
 | `memory_handoff_accept` | destructive | Fetch + ack an open own/shared handoff. Pass `handoff_id` from `memory_handoff_list` to claim that exact row; omitting it still claims the latest eligible open handoff (automatic handoffs are cwd-matched). Root-only `any_owner=true` recovers across operators. Optional `workspace` + `project` targets a named sibling workspace/project. |
 | `memory_handoff_cancel` | destructive | Mark an exact visible open handoff id expired when it was created by mistake; root-only `any_owner=true` recovers across operators. |
 
+Automatic SessionStart handoff headers include the handoff ID, workspace ID,
+and project ID (stable identifiers, not scope names). Receivers can reconcile
+these with publication evidence without claiming the already-consumed handoff
+again. Stored handoff prose remains inside the untrusted-history boundary;
+identity metadata does not grant permissions or change acceptance semantics.
+
 `memory_handoff_list` is the inspect-without-claim path for clients that cannot inject SessionStart stdout. `memory_handoff_cancel` needs an exact id. `ai-memory handoffs` lists the open
 handoffs for a project, oldest first, with their ids — read-only, and
 content-free (identity, provenance and age, never the summary body). Automatic
